@@ -1,0 +1,5 @@
+name = Ding DIBS EWR (External Webservice Reports)
+description = Allows to push DIBS reports to external webservice
+core = 7.x
+dependencies[] = ding_dibs
+configure = admin/config/payment/ewr

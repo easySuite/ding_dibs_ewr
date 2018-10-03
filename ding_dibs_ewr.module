@@ -1,0 +1,191 @@
+<?php
+
+/**
+ * @file
+ * Ding DIBS EWR module functionality.
+ */
+
+include "lib/Cs3ws.php";
+include "lib/registerCapturedPayment.php";
+include "lib/registerCapturedPaymentResponse.php";
+include "lib/CustomerInfo.php";
+
+/**
+ * Implements hook_menu().
+ */
+function ding_dibs_ewr_menu() {
+  $items['admin/config/payment/ewr'] = [
+    'title' => 'Ding DIBS EWR',
+    'description' => 'Configure DIBS External Webservice Reports.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => ['ding_dibs_ewr_settings_form'],
+    'access arguments' => ['administer dibs settings'],
+    'type' => MENU_NORMAL_ITEM,
+  ];
+
+  $items['admin/config/payment/ewr/settings'] = [
+    'title' => 'Ding DIBS EWR settings',
+    'description' => 'Configure DIBS External Webservice Reports',
+    'weight' => 0,
+    'tab_parent' => 'admin/config/payment/ewr',
+    'access callback' => TRUE,
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  ];
+
+  $items['admin/config/payment/ewr/log'] = [
+    'title' => 'Logs',
+    'description' => 'Logs of pushing captured payments to webservice.',
+    'page callback' => 'ding_dibs_ewr_capture_logs',
+    'access arguments' => 'administer dibs settings',
+    'access callback' => TRUE,
+    'type' => MENU_LOCAL_TASK,
+  ];
+
+  return $items;
+}
+
+/**
+ * Settings form.
+ */
+function ding_dibs_ewr_settings_form($form) {
+  $form['ding_dibs_ewr']['ding_dibs_ewr_webservice_url'] = [
+    '#type' => 'textfield',
+    '#title' => t('Webservice URL'),
+    '#description' => t('URL to webservice, with WSDL. Example: <i>https://service.viborg.dk/ws/services/cs3-ws?wsdl</i>'),
+    '#default_value' => variable_get('ding_dibs_ewr_webservice_url', ''),
+    '#required' => TRUE,
+  ];
+
+  $form['ding_dibs_ewr']['ding_dibs_ewr_organization_id'] = [
+    '#type' => 'textfield',
+    '#title' => t('Organization ID'),
+    '#default_value' => variable_get('ding_dibs_ewr_organization_id', ''),
+    '#required' => TRUE,
+  ];
+
+  $form['ding_dibs_ewr']['ding_dibs_ewr_terminal_id'] = [
+    '#type' => 'textfield',
+    '#title' => t('Terminal ID'),
+    '#default_value' => variable_get('ding_dibs_ewr_terminal_id', ''),
+    '#required' => TRUE,
+  ];
+
+  $form['ding_dibs_ewr']['ding_dibs_ewr_terminal_password'] = [
+    '#type' => 'textfield',
+    '#title' => t('Terminal Password'),
+    '#default_value' => variable_get('ding_dibs_ewr_terminal_password', ''),
+    '#required' => TRUE,
+  ];
+
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_ding_dibs_capture_accepted_alter().
+ */
+function ding_dibs_ewr_ding_dibs_capture_accepted_alter(array $transaction) {
+  if ($transaction) {
+    $ws_url = variable_get('ding_dibs_ewr_webservice_url', '');
+    $organization_id = variable_get('ding_dibs_ewr_organization_id', '');
+    $terminal_id = variable_get('ding_dibs_ewr_terminal_id', '');
+    $terminal_password = variable_get('ding_dibs_ewr_terminal_password', '');
+
+    $customer_info = new CustomerInfo();
+    $customer_info->setAddress1($transaction['customer_address']);
+    $customer_info->setAddress2($transaction['customer_address_2']);
+    $customer_info->setCity($transaction['customer_city']);
+    $customer_info->setCountry($transaction['customer_country']);
+    $customer_info->setEmail($transaction['customer_email']);
+    $customer_info->setName($transaction['customer_name']);
+    $customer_info->setPhone($transaction['customer_phone']);
+    $customer_info->setZip($transaction['customer_zipcode']);
+
+    $captured_payment = new RegisterCapturedPayment(
+      $organization_id,
+      $terminal_id,
+      $terminal_password,
+      $transaction['payment_transaction_id'],
+      $transaction['payment_order_id'],
+      $transaction['order_price_info']['Total'] * 100,
+      $transaction['order_info_short'],
+      $customer_info
+    );
+
+    $req = new Cs3ws($ws_url, []);
+
+    try {
+      $report_id = $req->registerCapturedPayment($captured_payment)
+        ->getReturn();
+      watchdog('ding_dibs_ewr', 'Report with id !report_id was pushed to Web Service', ['!report_id' => $report_id]);
+
+      db_insert('ding_dibs_ewr_logs')
+        ->fields([
+          'report_id',
+          'transaction_id',
+          'order_id',
+          'amount',
+          'created',
+        ])
+        ->values([
+          'report_id' => $report_id,
+          'transaction_id' => $transaction['payment_transaction_id'],
+          'order_id' => $transaction['payment_order_id'],
+          'amount' => $transaction['order_price_info']['Total'],
+          'created' => strtotime($transaction['payment_time']),
+        ])
+        ->execute();
+    }
+    catch (Exception $exception) {
+      watchdog('ding_dibs_ewr', 'There were problems in communication with Reports service. Please check logs. Error message: @error_message', ['@error_message' => $exception->getMessage()]);
+    }
+  }
+}
+
+/**
+ * Menu callback.
+ *
+ * Collecting data and rendering it in table format.
+ */
+function ding_dibs_ewr_capture_logs() {
+  $header = [
+    ['data' => 'Report ID<div class="description" style="text-transform: none;">Returned repord id.</div>'],
+    ['data' => 'Transaction ID<div class="description" style="text-transform: none;">DIBS Transaction ID</div>'],
+    ['data' => 'Order ID<div class="description" style="text-transform: none;">DIBS Order ID</div>'],
+    ['data' => 'Amount<div class="description" style="text-transform: none;">Sum of transaction (DKK)</div>'],
+    ['data' => 'Creation date<div class="description" style="text-transform: none;">Date of push to webservice.</div>'],
+  ];
+
+  $query = db_select('ding_dibs_ewr_logs', 'dl')
+    ->fields('dl');
+  $query->extend('PagerDefault')->limit(20);
+  $query->orderBy('id', 'DESC');
+  $results = $query->execute()->fetchAll();
+
+  $rows = [];
+  foreach ($results as $result) {
+    $rows[] = [
+      'data' => [
+        'report_id' => $result->report_id,
+        'transaction_id' => $result->transaction_id,
+        'order_id' => $result->order_id,
+        'amount' => $result->amount,
+        'created' => date('Y-m-d H:i', $result->created),
+      ],
+    ];
+  }
+
+  $options = [
+    'header' => $header,
+    'rows' => $rows,
+    'attributes' => [],
+    'caption' => '',
+    'colgroups' => [],
+    'sticky' => TRUE,
+    'empty' => 'No data.',
+  ];
+
+  $output = theme_table($options);
+  $output .= theme('pager');
+
+  return $output;
+}
